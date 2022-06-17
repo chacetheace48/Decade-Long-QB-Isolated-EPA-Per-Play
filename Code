@@ -1,0 +1,5363 @@
+### Master RAPM Code
+rm(list = ls())
+
+
+### Load Packages
+library(tidyverse)
+library(ggrepel)
+library(ggimage)
+library(nflfastR)
+library(na.tools)
+library(broom)
+library(glmnet)
+library(fastDummies)
+library(dummies)
+
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+
+
+
+### Get the data, Begin Adding the Variables to the Dataset
+data <- load_pbp(2021)
+
+
+pbp_rp_19 <- data %>% 
+  filter(qb_dropback == 1) 
+
+
+pbp_rp_19 <- pbp_rp_19 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+### Calculate the QB EPA, only regular Season
+
+### At least 50 Dropbacks
+qbs <- pbp_rp_19 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall <- pbp_rp_19 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall
+
+### In Case You Want a Raw EPA Graph
+qbs <- qbs %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_21_adjusted <- pbp_rp_19 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+
+glimpse(passes_roundwp_21_adjusted)
+
+### ADD QB Dummy Variabels
+passes_roundwp_21_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_21_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_21_adjusted2 <- passes_roundwp_21_adjusted2[ -c(1) ]
+passes_roundwp_21_adjusted <- cbind(passes_roundwp_21_adjusted,passes_roundwp_21_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_21_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_21_adjusted$defteam)
+passes_roundwp_21_adjusted3 <- passes_roundwp_21_adjusted3[ -c(1) ]
+
+passes_roundwp_21_adjusted <- cbind(passes_roundwp_21_adjusted,passes_roundwp_21_adjusted3)
+
+
+
+### Back To the Analysis 
+passes_roundwp_21_adjusted$fumble_was_qb[is.na(passes_roundwp_21_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes21 <- passes_roundwp_21_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_21_adjusted_no_twos <- passes_roundwp_21_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table21 <- passes_roundwp_21_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+
+
+### Back to normal code
+qbs <- passes_roundwp_21_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+
+### Get Interception and Fumble Data
+pick_data21 <- passes_roundwp_21_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data21 <- passes_roundwp_21_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa21 <- mean(pick_data21$epa)
+average_fumble_Epa21 <- mean(fumble_Data21$epa)
+
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks21 <- passes_roundwp_21_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa21,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again <- adjusted_epa_to_picks21 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa21,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2 <- passes_roundwp_21_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+used_qbs_21 <- qbs2 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+used_qbs_21 <- qbs %>%
+  filter(n_dropbacks >=1) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_21 <- passes_roundwp_21_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+glimpse(adjusted_epa_again)
+
+### 
+number_of_Vars <- length(adjusted_epa_again)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_21 <- adjusted_epa_again[,c(23,26,31:32,377,381:384,387:
+                                                    #### Update the 525 to whatever number the number of VARS
+                                                    ### THing gives us, subtract 2, so at 525, do 523
+                                                    538)]
+
+
+passing_epa_table21 <- adjusted_epa_again %>%
+  select(epa_new2)
+
+
+try <- as.vector(passing_epa_table21)
+try1 <- as.vector(info_about_passes_try_21)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table21$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+
+summary(fit)
+
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_21 <- ridge_cv$lambda.min
+best_lambda_21
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_21 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_21)
+
+coef(best_ridge_21)
+
+### Gets your coefficents
+coef_2021 <- tidy(best_ridge_21)
+
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2021)
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_21 <- coef_2021[c(11:128),]
+
+
+qb_names_21 <- ridge_qbs_21$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_21 <- cbind(ridge_qbs_21,qb_names_21)
+
+qb_data_frame <- as.data.frame(qbs)
+class(qb_data_frame)
+
+### For Later
+nfl_logos_df <- read_csv("https://raw.githubusercontent.com/statsbylopez/BlogPosts/master/nfl_teamlogos.csv")
+
+joined_data <- full_join(ridge_qbs_21, qb_data_frame, by = c("qb_names_21" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_21 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2021,
+                            estimate == 44444 ~ 2011))
+
+
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph <- qb_chart_21 %>%
+  filter(n_dropbacks > 199)
+
+
+qb_graph_21 <- ggplot(for_Graph, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph$qb_names_21 == "M.Jones" | for_Graph$qb_names_21 == "T.Lance" | for_Graph$qb_names_21 == "T.Lawrence" | for_Graph$qb_names_21 == "J.Fields" | for_Graph$qb_names_21 == "Z.Wilson", "red", "black"), cex=for_Graph$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_21),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_21
+
+
+qb_graph_2 <- ggplot(for_Graph, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = for_Graph$team_color, cex=for_Graph$n_plays / 50, alpha = .6) +  
+  geom_text_repel(aes(label=qb_names_21),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Completion Percentaege Above Expected",
+       y="Isolated EPA Per Play",
+       caption = "CPOE and EPA (Expected Points Added) from nflfastR, Model @CMHockey66. Minimum 200 Dropbacks on Image",
+       title = "Isolated QB Passing EPA Per Play",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust=0.5)) 
+
+
+qb_graph_2
+
+
+tail(info_about_passes_try_21)
+
+
+#### If you want to find deltas between EPA and Isolated EPA
+mean_est <- mean(qb_chart_21$estimate)
+sd_est <- sd(qb_chart_21$estimate)
+
+mean_epa <- mean(qb_chart_21$epa)
+sd_epa <- sd(qb_chart_21$epa)
+
+
+
+with_z <- qb_chart_21 %>%
+  mutate(estimtae_z = (estimate -mean_est)/sd_est ) %>%
+  mutate(epa_Z = (epa -mean_epa)/sd_epa ) %>% 
+  mutate(diff = estimtae_z - epa_Z)
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+
+
+### Will tell you when to end
+
+teams_end <- nrow(coef_2021)
+as.numeric(teams_end)
+
+
+ridge_teams_21 <- coef_2021[c(129:160),] 
+
+
+team_names_21 <- ridge_teams_21$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_21 <- cbind(ridge_teams_21,team_names_21)
+dchart_21 <- ridge_teams_21 %>% left_join(nfl_logos_df, by = c("team_names_21" = "team_code"))
+dchart_21 <- dchart_21 %>% left_join(Team_Pass_EPA_Defence_21, by = c("team_names_21" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2021,
+                            estimate == 44444 ~ 2011)) 
+
+adjusted_epa_d_21 <- ggplot(dchart_21, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_21$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_21$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Success Rate and EPA (Expected Points Added) from nflfastR, Model @CMHockey66",
+       title = "Team Defence Passing EPA Per Play (2021)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust=0.5))
+
+adjusted_epa_d_21
+
+
+controls <- coef_2021[c(2:10),] 
+
+controls_graph <- ggplot(controls, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2021)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+
+
+
+
+
+data_2020 <- load_pbp(2020)
+
+pbp_rp_20 <- data_2020 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_20 <- pbp_rp_20 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_20 <- pbp_rp_20 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_20 <- pbp_rp_20 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_20
+
+
+### In Case You Want a Raw EPA Graph
+qbs_20 <- qbs_20 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+### Add Control Variables to the Data
+passes_roundwp_20_adjusted <- pbp_rp_20 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_20_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_20_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_20_adjusted2 <- passes_roundwp_20_adjusted2[ -c(1) ]
+passes_roundwp_20_adjusted <- cbind(passes_roundwp_20_adjusted,passes_roundwp_20_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_20_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_20_adjusted$defteam)
+passes_roundwp_20_adjusted3 <- passes_roundwp_20_adjusted3[ -c(1) ]
+
+passes_roundwp_20_adjusted <- cbind(passes_roundwp_20_adjusted,passes_roundwp_20_adjusted3)
+
+
+### Back To the Analysis 
+passes_roundwp_20_adjusted$fumble_was_qb[is.na(passes_roundwp_20_adjusted$fumble_was_qb)] <- 0
+
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes20 <- passes_roundwp_20_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_20_adjusted_no_twos <- passes_roundwp_20_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table20 <- passes_roundwp_20_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+
+### Back to normal code
+qbs_2020 <- passes_roundwp_20_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+### Get Interception and Fumble Data
+pick_data20 <- passes_roundwp_20_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data20 <- passes_roundwp_20_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa20 <- mean(pick_data20$epa)
+average_fumble_Epa20 <- mean(fumble_Data20$epa)
+
+
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks20 <- passes_roundwp_20_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa20,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_20 <- adjusted_epa_to_picks20 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa20,
+                              fumble_was_qb != 1 ~ epa_new))
+
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2020 <- passes_roundwp_20_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_20 <- qbs2_2020 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+used_qbs_20 <- qbs_2020 %>%
+  filter(n_dropbacks >=1) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_20 <- passes_roundwp_20_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_20)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_20 <- adjusted_epa_again_20[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       536)]
+passing_epa_table20 <- adjusted_epa_again_20 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table20)
+try1 <- as.vector(info_about_passes_try_20)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table21$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+
+summary(fit)
+
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_20 <- ridge_cv$lambda.min
+best_lambda_20
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_20 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_20)
+
+coef(best_ridge_20)
+
+### Gets your coefficents
+coef_2020 <- tidy(best_ridge_20)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2020)
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_20 <- coef_2020[c(11:126),]
+
+qb_names_20 <- ridge_qbs_20$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_20 <- cbind(ridge_qbs_20,qb_names_20)
+
+qb_data_frame <- as.data.frame(qbs2_2020)
+class(qb_data_frame)
+
+### For Later
+nfl_logos_df <- read_csv("https://raw.githubusercontent.com/statsbylopez/BlogPosts/master/nfl_teamlogos.csv")
+
+joined_data <- full_join(ridge_qbs_20, qb_data_frame, by = c("qb_names_20" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_20 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2020,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2020 <- qb_chart_20 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_20 <- ggplot(for_Graph_2020, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2020$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2020$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2020$qb_names_20 == "T.Brady" | for_Graph_2020$qb_names_20 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2020$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_20),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2021 to December 26th 2020)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_20
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+
+### Will tell you when to end
+
+teams_end <- nrow(coef_2020)
+as.numeric(teams_end)
+
+ridge_teams_20 <- coef_2020[c(127:158),] 
+
+team_names_20 <- ridge_teams_20$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_20 <- cbind(ridge_teams_20,team_names_20)
+dchart_20 <- ridge_teams_20 %>% left_join(nfl_logos_df, by = c("team_names_20" = "team_code"))
+dchart_20 <- dchart_20 %>% left_join(Team_Pass_EPA_Defence_20, by = c("team_names_20" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2020,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_20 <- ggplot(dchart_20, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_20$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_20$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2020)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_20
+
+
+controls_2020 <- coef_2020[c(2:10),] 
+
+controls_graph <- ggplot(controls_2020, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2020)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2019 <- load_pbp(2019)
+
+pbp_rp_19 <- data_2019 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_19 <- pbp_rp_19 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_19 <- pbp_rp_19 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_19 <- pbp_rp_19 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_19
+
+### In Case You Want a Raw EPA Graph
+qbs_19 <- qbs_19 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+### Add Control Variables to the Data
+passes_roundwp_19_adjusted <- pbp_rp_19 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_19_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_19_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_19_adjusted2 <- passes_roundwp_19_adjusted2[ -c(1) ]
+passes_roundwp_19_adjusted <- cbind(passes_roundwp_19_adjusted,passes_roundwp_19_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_19_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_19_adjusted$defteam)
+passes_roundwp_19_adjusted3 <- passes_roundwp_19_adjusted3[ -c(1) ]
+
+passes_roundwp_19_adjusted <- cbind(passes_roundwp_19_adjusted,passes_roundwp_19_adjusted3)
+
+
+### Back To the Analysis 
+passes_roundwp_19_adjusted$fumble_was_qb[is.na(passes_roundwp_19_adjusted$fumble_was_qb)] <- 0
+
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes19 <- passes_roundwp_19_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_19_adjusted_no_twos <- passes_roundwp_19_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table19 <- passes_roundwp_19_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+
+### Get Interception and Fumble Data
+pick_data19 <- passes_roundwp_19_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data19 <- passes_roundwp_19_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa19 <- mean(pick_data19$epa)
+average_fumble_Epa19 <- mean(fumble_Data19$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks19 <- passes_roundwp_19_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa19,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_19 <- adjusted_epa_to_picks19 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa19,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2019 <- passes_roundwp_19_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_19 <- qbs2_2019 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+used_qbs_19 <- qbs2_2019 %>%
+  filter(n_dropbacks >=1) %>%
+  filter(name != "NA")
+
+
+Team_Pass_EPA_Defence_19 <- passes_roundwp_19_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_19)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_19 <- adjusted_epa_again_19[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       525)]
+
+passing_epa_table19 <- adjusted_epa_again_19 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table19)
+try1 <- as.vector(info_about_passes_try_19)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table19$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_19 <- ridge_cv$lambda.min
+best_lambda_19
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_19 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_19)
+
+coef(best_ridge_19)
+
+### Gets your coefficents
+coef_2019 <- tidy(best_ridge_19)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2019)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_19 <- coef_2019[c(11:115),]
+
+qb_names_19 <- ridge_qbs_19$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_19 <- cbind(ridge_qbs_19,qb_names_19)
+
+qb_data_frame <- as.data.frame(qbs2_2019)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_19, qb_data_frame, by = c("qb_names_19" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_19 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2019,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2019 <- qb_chart_19 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_19 <- ggplot(for_Graph_2019, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2019$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2019$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2019$qb_names_19 == "T.Brady" | for_Graph_2019$qb_names_19 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2019$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_19),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_19
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2019)
+as.numeric(teams_end)
+
+ridge_teams_19 <- coef_2019[c(116:147),] 
+
+team_names_19 <- ridge_teams_19$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_19 <- cbind(ridge_teams_19,team_names_19)
+dchart_19 <- ridge_teams_19 %>% left_join(nfl_logos_df, by = c("team_names_19" = "team_code"))
+dchart_19 <- dchart_19 %>% left_join(Team_Pass_EPA_Defence_19, by = c("team_names_19" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2019,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_19 <- ggplot(dchart_19, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_19$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_19$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_19
+
+
+controls_2019 <- coef_2019[c(2:10),] 
+
+controls_graph <- ggplot(controls_2019, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2019)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2018 <- load_pbp(2018)
+
+pbp_rp_18 <- data_2018 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_18 <- pbp_rp_18 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_18 <- pbp_rp_18 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_18 <- pbp_rp_18 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_18
+
+### In Case You Want a Raw EPA Graph
+qbs_18 <- qbs_18 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_18_adjusted <- pbp_rp_18 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_18_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_18_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_18_adjusted2 <- passes_roundwp_18_adjusted2[ -c(1) ]
+passes_roundwp_18_adjusted <- cbind(passes_roundwp_18_adjusted,passes_roundwp_18_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_18_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_18_adjusted$defteam)
+passes_roundwp_18_adjusted3 <- passes_roundwp_18_adjusted3[ -c(1) ]
+
+passes_roundwp_18_adjusted <- cbind(passes_roundwp_18_adjusted,passes_roundwp_18_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_18_adjusted$fumble_was_qb[is.na(passes_roundwp_18_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes18 <- passes_roundwp_18_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_18_adjusted_no_twos <- passes_roundwp_18_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table18 <- passes_roundwp_18_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data18 <- passes_roundwp_18_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data18 <- passes_roundwp_18_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa18 <- mean(pick_data18$epa)
+average_fumble_Epa18 <- mean(fumble_Data18$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks18 <- passes_roundwp_18_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa18,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_18 <- adjusted_epa_to_picks18 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa18,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2018 <- passes_roundwp_18_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_18 <- qbs2_2018 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_18 <- passes_roundwp_18_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_18)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_18 <- adjusted_epa_again_18[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       526)]
+passing_epa_table18 <- adjusted_epa_again_18 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table18)
+try1 <- as.vector(info_about_passes_try_18)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table18$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_18 <- ridge_cv$lambda.min
+best_lambda_18
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_18 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_18)
+
+coef(best_ridge_18)
+
+### Gets your coefficents
+coef_2018 <- tidy(best_ridge_18)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2018)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_18 <- coef_2018[c(11:116),]
+
+qb_names_18 <- ridge_qbs_18$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_18 <- cbind(ridge_qbs_18,qb_names_18)
+
+qb_data_frame <- as.data.frame(qbs2_2018)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_18, qb_data_frame, by = c("qb_names_18" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_18 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2018,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2018 <- qb_chart_18 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_18 <- ggplot(for_Graph_2018, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2018$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2018$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2018$qb_names_18 == "T.Brady" | for_Graph_2018$qb_names_18 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2018$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_18),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_18
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2018)
+as.numeric(teams_end)
+
+ridge_teams_18 <- coef_2018[c(117:148),] 
+
+team_names_18 <- ridge_teams_18$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_18 <- cbind(ridge_teams_18,team_names_18)
+dchart_18 <- ridge_teams_18 %>% left_join(nfl_logos_df, by = c("team_names_18" = "team_code"))
+dchart_18 <- dchart_18 %>% left_join(Team_Pass_EPA_Defence_18, by = c("team_names_18" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2018,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_18 <- ggplot(dchart_18, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_18$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_18$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_18
+
+controls_2018 <- coef_2018[c(2:10),] 
+
+controls_graph <- ggplot(controls_2018, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2019)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2017 <- load_pbp(2017)
+
+pbp_rp_17 <- data_2017 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_17 <- pbp_rp_17 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_17 <- pbp_rp_17 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_17 <- pbp_rp_17 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_17
+
+### In Case You Want a Raw EPA Graph
+qbs_17 <- qbs_17 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_17_adjusted <- pbp_rp_17 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_17_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_17_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_17_adjusted2 <- passes_roundwp_17_adjusted2[ -c(1) ]
+passes_roundwp_17_adjusted <- cbind(passes_roundwp_17_adjusted,passes_roundwp_17_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_17_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_17_adjusted$defteam)
+passes_roundwp_17_adjusted3 <- passes_roundwp_17_adjusted3[ -c(1) ]
+
+passes_roundwp_17_adjusted <- cbind(passes_roundwp_17_adjusted,passes_roundwp_17_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_17_adjusted$fumble_was_qb[is.na(passes_roundwp_17_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes17 <- passes_roundwp_17_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_17_adjusted_no_twos <- passes_roundwp_17_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table17 <- passes_roundwp_17_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data17 <- passes_roundwp_17_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data17 <- passes_roundwp_17_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa17 <- mean(pick_data17$epa)
+average_fumble_Epa17 <- mean(fumble_Data17$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks17 <- passes_roundwp_17_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa17,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_17 <- adjusted_epa_to_picks17 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa17,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2017 <- passes_roundwp_17_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_17 <- qbs2_2017 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_17 <- passes_roundwp_17_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_17)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_17 <- adjusted_epa_again_17[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       513)]
+passing_epa_table17 <- adjusted_epa_again_17 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table17)
+try1 <- as.vector(info_about_passes_try_17)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table17$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_17 <- ridge_cv$lambda.min
+best_lambda_17
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_17 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_17)
+
+coef(best_ridge_17)
+
+### Gets your coefficents
+coef_2017 <- tidy(best_ridge_17)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2017)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_17 <- coef_2017[c(11:104),]
+
+qb_names_17 <- ridge_qbs_17$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_17 <- cbind(ridge_qbs_17,qb_names_17)
+
+qb_data_frame <- as.data.frame(qbs2_2017)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_17, qb_data_frame, by = c("qb_names_17" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_17 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2017,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2017 <- qb_chart_17 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_17 <- ggplot(for_Graph_2017, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2017$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2017$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2017$qb_names_17 == "T.Brady" | for_Graph_2017$qb_names_17 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2017$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_17),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_17
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2017)
+as.numeric(teams_end)
+
+ridge_teams_17 <- coef_2017[c(105:136),] 
+
+team_names_17 <- ridge_teams_17$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_17 <- cbind(ridge_teams_17,team_names_17)
+dchart_17 <- ridge_teams_17 %>% left_join(nfl_logos_df, by = c("team_names_17" = "team_code"))
+dchart_17 <- dchart_17 %>% left_join(Team_Pass_EPA_Defence_17, by = c("team_names_17" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2017,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_17 <- ggplot(dchart_17, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_17$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_17$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_17
+
+controls_2017 <- coef_2017[c(2:10),] 
+
+controls_graph <- ggplot(controls_2017, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2019)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2016 <- load_pbp(2016)
+
+pbp_rp_16 <- data_2016 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_16 <- pbp_rp_16 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_16 <- pbp_rp_16 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_16 <- pbp_rp_16 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_16
+
+### In Case You Want a Raw EPA Graph
+qbs_16 <- qbs_16 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_16_adjusted <- pbp_rp_16 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_16_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_16_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_16_adjusted2 <- passes_roundwp_16_adjusted2[ -c(1) ]
+passes_roundwp_16_adjusted <- cbind(passes_roundwp_16_adjusted,passes_roundwp_16_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_16_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_16_adjusted$defteam)
+passes_roundwp_16_adjusted3 <- passes_roundwp_16_adjusted3[ -c(1) ]
+
+passes_roundwp_16_adjusted <- cbind(passes_roundwp_16_adjusted,passes_roundwp_16_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_16_adjusted$fumble_was_qb[is.na(passes_roundwp_16_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes16 <- passes_roundwp_16_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_16_adjusted_no_twos <- passes_roundwp_16_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table16 <- passes_roundwp_16_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data16 <- passes_roundwp_16_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data16 <- passes_roundwp_16_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa16 <- mean(pick_data16$epa)
+average_fumble_Epa16 <- mean(fumble_Data16$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks16 <- passes_roundwp_16_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa16,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_16 <- adjusted_epa_to_picks16 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa16,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2016 <- passes_roundwp_16_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_16 <- qbs2_2016 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_16 <- passes_roundwp_16_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_16)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_16 <- adjusted_epa_again_16[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       514)]
+passing_epa_table16 <- adjusted_epa_again_16 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table16)
+try1 <- as.vector(info_about_passes_try_16)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table16$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_16 <- ridge_cv$lambda.min
+best_lambda_16
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_16 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_16)
+
+coef(best_ridge_16)
+
+### Gets your coefficents
+coef_2016 <- tidy(best_ridge_16)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2016)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_16 <- coef_2016[c(11:105),]
+
+qb_names_16 <- ridge_qbs_16$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_16 <- cbind(ridge_qbs_16,qb_names_16)
+
+qb_data_frame <- as.data.frame(qbs2_2016)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_16, qb_data_frame, by = c("qb_names_16" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_16 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2016,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2016 <- qb_chart_16 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_16 <- ggplot(for_Graph_2016, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2016$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2016$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2016$qb_names_16 == "T.Brady" | for_Graph_2016$qb_names_16 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2016$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_16),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2016)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_16
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2016)
+as.numeric(teams_end)
+
+ridge_teams_16 <- coef_2016[c(106:137),] 
+
+team_names_16 <- ridge_teams_16$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_16 <- cbind(ridge_teams_16,team_names_16)
+dchart_16 <- ridge_teams_16 %>% left_join(nfl_logos_df, by = c("team_names_16" = "team_code"))
+dchart_16 <- dchart_16 %>% left_join(Team_Pass_EPA_Defence_16, by = c("team_names_16" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2016,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_16 <- ggplot(dchart_16, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_16$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_16$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2016)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_16
+
+controls_2016 <- coef_2016[c(2:10),] 
+
+controls_graph <- ggplot(controls_2016, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2016)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2015 <- load_pbp(2015)
+
+pbp_rp_15 <- data_2015 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_15 <- pbp_rp_15 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_15 <- pbp_rp_15 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_15 <- pbp_rp_15 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_16
+
+### In Case You Want a Raw EPA Graph
+qbs_15 <- qbs_15 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_15_adjusted <- pbp_rp_15 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_15_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_15_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_15_adjusted2 <- passes_roundwp_15_adjusted2[ -c(1) ]
+passes_roundwp_15_adjusted <- cbind(passes_roundwp_15_adjusted,passes_roundwp_15_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_15_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_15_adjusted$defteam)
+passes_roundwp_15_adjusted3 <- passes_roundwp_15_adjusted3[ -c(1) ]
+
+passes_roundwp_15_adjusted <- cbind(passes_roundwp_15_adjusted,passes_roundwp_15_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_15_adjusted$fumble_was_qb[is.na(passes_roundwp_15_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes15 <- passes_roundwp_15_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_15_adjusted_no_twos <- passes_roundwp_15_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table15 <- passes_roundwp_15_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data15 <- passes_roundwp_15_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data15 <- passes_roundwp_15_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa15 <- mean(pick_data15$epa)
+average_fumble_Epa15 <- mean(fumble_Data15$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks15 <- passes_roundwp_15_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa15,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_15 <- adjusted_epa_to_picks15 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa15,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2015 <- passes_roundwp_15_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_15 <- qbs2_2015 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_15 <- passes_roundwp_15_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_15)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_15 <- adjusted_epa_again_15[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       508)]
+passing_epa_table15 <- adjusted_epa_again_15 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table15)
+try1 <- as.vector(info_about_passes_try_15)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table15$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_15 <- ridge_cv$lambda.min
+best_lambda_15
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_15 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_15)
+
+coef(best_ridge_15)
+
+### Gets your coefficents
+coef_2015 <- tidy(best_ridge_15)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2015)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_15 <- coef_2015[c(11:99),]
+
+qb_names_15 <- ridge_qbs_15$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_15 <- cbind(ridge_qbs_15,qb_names_15)
+
+qb_data_frame <- as.data.frame(qbs2_2015)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_15, qb_data_frame, by = c("qb_names_15" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_15 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2015,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2015 <- qb_chart_15 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_15 <- ggplot(for_Graph_2015, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2015$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2015$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2015$qb_names_15 == "T.Brady" | for_Graph_2015$qb_names_15 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2015$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_15),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_15
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2015)
+as.numeric(teams_end)
+
+ridge_teams_15 <- coef_2015[c(100:131),] 
+
+team_names_15 <- ridge_teams_15$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_15 <- cbind(ridge_teams_15,team_names_15)
+dchart_15 <- ridge_teams_15 %>% left_join(nfl_logos_df, by = c("team_names_15" = "team_code"))
+dchart_15 <- dchart_15 %>% left_join(Team_Pass_EPA_Defence_15, by = c("team_names_15" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2015,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_15 <- ggplot(dchart_15, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_15$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_15$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_15
+
+controls_2015 <- coef_2015[c(2:10),] 
+
+controls_graph <- ggplot(controls_2015, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2019)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2014 <- load_pbp(2014)
+
+pbp_rp_14 <- data_2014 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_14 <- pbp_rp_14 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_14 <- pbp_rp_14 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_14 <- pbp_rp_14 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_14
+
+### In Case You Want a Raw EPA Graph
+qbs_14 <- qbs_14 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_14_adjusted <- pbp_rp_14 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_14_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_14_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_14_adjusted2 <- passes_roundwp_14_adjusted2[ -c(1) ]
+passes_roundwp_14_adjusted <- cbind(passes_roundwp_14_adjusted,passes_roundwp_14_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_14_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_14_adjusted$defteam)
+passes_roundwp_14_adjusted3 <- passes_roundwp_14_adjusted3[ -c(1) ]
+
+passes_roundwp_14_adjusted <- cbind(passes_roundwp_14_adjusted,passes_roundwp_14_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_14_adjusted$fumble_was_qb[is.na(passes_roundwp_14_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes14 <- passes_roundwp_14_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_14_adjusted_no_twos <- passes_roundwp_14_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table14 <- passes_roundwp_14_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data14 <- passes_roundwp_14_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data14 <- passes_roundwp_14_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa14 <- mean(pick_data14$epa)
+average_fumble_Epa14 <- mean(fumble_Data14$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks14 <- passes_roundwp_14_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa14,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_14 <- adjusted_epa_to_picks14 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa14,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2014 <- passes_roundwp_14_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_14 <- qbs2_2014 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_14 <- passes_roundwp_14_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_14)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_14 <- adjusted_epa_again_14[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       519)]
+passing_epa_table14 <- adjusted_epa_again_14 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table14)
+try1 <- as.vector(info_about_passes_try_14)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table14$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_14 <- ridge_cv$lambda.min
+best_lambda_14
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_14 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_14)
+
+coef(best_ridge_14)
+
+### Gets your coefficents
+coef_2014 <- tidy(best_ridge_14)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2014)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_14 <- coef_2014[c(11:111),]
+
+qb_names_14 <- ridge_qbs_14$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_14 <- cbind(ridge_qbs_14,qb_names_14)
+
+qb_data_frame <- as.data.frame(qbs2_2014)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_14, qb_data_frame, by = c("qb_names_14" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_14 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2014,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2014 <- qb_chart_14 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_14 <- ggplot(for_Graph_2014, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2014$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2014$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2014$qb_names_14 == "T.Brady" | for_Graph_2014$qb_names_14 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2014$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_14),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_14
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2014)
+as.numeric(teams_end)
+
+ridge_teams_14 <- coef_2014[c(112:143),] 
+
+team_names_14 <- ridge_teams_14$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_14 <- cbind(ridge_teams_14,team_names_14)
+dchart_14 <- ridge_teams_14 %>% left_join(nfl_logos_df, by = c("team_names_14" = "team_code"))
+dchart_14 <- dchart_14 %>% left_join(Team_Pass_EPA_Defence_14, by = c("team_names_14" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2014,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_14 <- ggplot(dchart_14, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_14$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_14$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_14
+
+controls_2014 <- coef_2014[c(2:10),] 
+
+controls_graph <- ggplot(controls_2014, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2019)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2013 <- load_pbp(2013)
+
+pbp_rp_13 <- data_2013 %>% 
+  filter(qb_dropback == 1)
+
+pbp_rp_13 <- pbp_rp_13 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_13 <- pbp_rp_13 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_13 <- pbp_rp_13 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_13
+
+### In Case You Want a Raw EPA Graph
+qbs_13 <- qbs_13 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_13_adjusted <- pbp_rp_13 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_13_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_13_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_13_adjusted2 <- passes_roundwp_13_adjusted2[ -c(1) ]
+passes_roundwp_13_adjusted <- cbind(passes_roundwp_13_adjusted,passes_roundwp_13_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_13_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_13_adjusted$defteam)
+passes_roundwp_13_adjusted3 <- passes_roundwp_13_adjusted3[ -c(1) ]
+
+passes_roundwp_13_adjusted <- cbind(passes_roundwp_13_adjusted,passes_roundwp_13_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_13_adjusted$fumble_was_qb[is.na(passes_roundwp_13_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes13 <- passes_roundwp_13_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_13_adjusted_no_twos <- passes_roundwp_13_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table13 <- passes_roundwp_13_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data13 <- passes_roundwp_13_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data13 <- passes_roundwp_13_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa13 <- mean(pick_data13$epa)
+average_fumble_Epa13 <- mean(fumble_Data13$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks13 <- passes_roundwp_13_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa13,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_13 <- adjusted_epa_to_picks13 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa13,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2013 <- passes_roundwp_13_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_13 <- qbs2_2013 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_13 <- passes_roundwp_13_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_13)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_13 <- adjusted_epa_again_13[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       502)]
+passing_epa_table13 <- adjusted_epa_again_13 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table13)
+try1 <- as.vector(info_about_passes_try_13)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table13$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_13 <- ridge_cv$lambda.min
+best_lambda_13
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_13 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_13)
+
+coef(best_ridge_13)
+
+### Gets your coefficents
+coef_2013 <- tidy(best_ridge_13)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2013)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_13 <- coef_2013[c(11:94),]
+
+qb_names_13 <- ridge_qbs_13$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_13 <- cbind(ridge_qbs_13,qb_names_13)
+
+qb_data_frame <- as.data.frame(qbs2_2013)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_13, qb_data_frame, by = c("qb_names_13" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_13 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2013,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2013 <- qb_chart_13 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_13 <- ggplot(for_Graph_2013, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2013$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2013$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2013$qb_names_13 == "T.Brady" | for_Graph_2013$qb_names_13 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2013$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_13),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_13
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2013)
+as.numeric(teams_end)
+
+ridge_teams_13 <- coef_2013[c(95:126),] 
+
+team_names_13 <- ridge_teams_13$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_13 <- cbind(ridge_teams_13,team_names_13)
+dchart_13 <- ridge_teams_13 %>% left_join(nfl_logos_df, by = c("team_names_13" = "team_code"))
+dchart_13 <- dchart_13 %>% left_join(Team_Pass_EPA_Defence_13, by = c("team_names_13" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2013,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_13 <- ggplot(dchart_13, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_13$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_13$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_13
+
+controls_2013 <- coef_2013[c(2:10),] 
+
+controls_graph <- ggplot(controls_2013, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2019)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2012 <- load_pbp(2012)
+
+pbp_rp_12 <- data_2012 %>% 
+  filter(qb_dropback == 1)
+
+pbp_rp_12 <- pbp_rp_12 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_12 <- pbp_rp_12 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_12 <- pbp_rp_12 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_12
+
+### In Case You Want a Raw EPA Graph
+qbs_12 <- qbs_12 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_12_adjusted <- pbp_rp_12 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_12_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_12_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_12_adjusted2 <- passes_roundwp_12_adjusted2[ -c(1) ]
+passes_roundwp_12_adjusted <- cbind(passes_roundwp_12_adjusted,passes_roundwp_12_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_12_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_12_adjusted$defteam)
+passes_roundwp_12_adjusted3 <- passes_roundwp_12_adjusted3[ -c(1) ]
+
+passes_roundwp_12_adjusted <- cbind(passes_roundwp_12_adjusted,passes_roundwp_12_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_12_adjusted$fumble_was_qb[is.na(passes_roundwp_12_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes12 <- passes_roundwp_12_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_12_adjusted_no_twos <- passes_roundwp_12_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table12 <- passes_roundwp_12_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data12 <- passes_roundwp_12_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data12 <- passes_roundwp_12_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa12 <- mean(pick_data12$epa)
+average_fumble_Epa12 <- mean(fumble_Data12$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks12 <- passes_roundwp_12_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa12,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_12 <- adjusted_epa_to_picks12 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa12,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2012 <- passes_roundwp_12_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_12 <- qbs2_2012 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_12 <- passes_roundwp_12_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_12)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_12 <- adjusted_epa_again_12[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       508)]
+passing_epa_table12 <- adjusted_epa_again_12 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table12)
+try1 <- as.vector(info_about_passes_try_12)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table12$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_12 <- ridge_cv$lambda.min
+best_lambda_12
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_12 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_12)
+
+coef(best_ridge_12)
+
+### Gets your coefficents
+coef_2012 <- tidy(best_ridge_12)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2012)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_12 <- coef_2012[c(11:98),]
+
+qb_names_12 <- ridge_qbs_12$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_12 <- cbind(ridge_qbs_12,qb_names_12)
+
+qb_data_frame <- as.data.frame(qbs2_2012)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_12, qb_data_frame, by = c("qb_names_12" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_12 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2012,
+                            estimate == 44444 ~ 2012))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2012 <- qb_chart_12 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_12 <- ggplot(for_Graph_2012, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2012$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2012$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2012$qb_names_12 == "T.Brady" | for_Graph_2012$qb_names_12 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2012$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_12),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_12
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2012)
+as.numeric(teams_end)
+
+ridge_teams_12 <- coef_2012[c(99:130),] 
+
+team_names_12 <- ridge_teams_12$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_12 <- cbind(ridge_teams_12,team_names_12)
+dchart_12 <- ridge_teams_12 %>% left_join(nfl_logos_df, by = c("team_names_12" = "team_code"))
+dchart_12 <- dchart_12 %>% left_join(Team_Pass_EPA_Defence_12, by = c("team_names_12" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2012,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_12 <- ggplot(dchart_12, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_12$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_12$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2019)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_12
+
+controls_2012 <- coef_2012[c(2:10),] 
+
+controls_graph <- ggplot(controls_2012, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2019)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2011 <- load_pbp(2011)
+
+pbp_rp_11 <- data_2011 %>% 
+  filter(qb_dropback == 1)
+
+pbp_rp_11 <- pbp_rp_11 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_11 <- pbp_rp_11 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_11 <- pbp_rp_11 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_11
+
+### In Case You Want a Raw EPA Graph
+qbs_11 <- qbs_11 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+
+### Add Control Variables to the Data
+passes_roundwp_11_adjusted <- pbp_rp_11 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_11_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_11_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_11_adjusted2 <- passes_roundwp_11_adjusted2[ -c(1) ]
+passes_roundwp_11_adjusted <- cbind(passes_roundwp_11_adjusted,passes_roundwp_11_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_11_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_11_adjusted$defteam)
+passes_roundwp_11_adjusted3 <- passes_roundwp_11_adjusted3[ -c(1) ]
+
+passes_roundwp_11_adjusted <- cbind(passes_roundwp_11_adjusted,passes_roundwp_11_adjusted3)
+
+### Back To the Analysis 
+passes_roundwp_11_adjusted$fumble_was_qb[is.na(passes_roundwp_11_adjusted$fumble_was_qb)] <- 0
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes11 <- passes_roundwp_11_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_11_adjusted_no_twos <- passes_roundwp_11_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table11 <- passes_roundwp_11_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+### Get Interception and Fumble Data
+pick_data11 <- passes_roundwp_11_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data11 <- passes_roundwp_11_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa11 <- mean(pick_data11$epa)
+average_fumble_Epa11 <- mean(fumble_Data11$epa)
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks11 <- passes_roundwp_11_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa11,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_11 <- adjusted_epa_to_picks11 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa11,
+                              fumble_was_qb != 1 ~ epa_new))
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2011 <- passes_roundwp_11_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_11 <- qbs2_2011 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_11 <- passes_roundwp_11_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_11)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_11 <- adjusted_epa_again_11[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       516)]
+passing_epa_table11 <- adjusted_epa_again_11 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table11)
+try1 <- as.vector(info_about_passes_try_11)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table11$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+summary(fit)
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_11 <- ridge_cv$lambda.min
+best_lambda_11
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_11 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_11)
+
+coef(best_ridge_11)
+
+### Gets your coefficents
+coef_2011 <- tidy(best_ridge_11)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2011)
+
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_11 <- coef_2011[c(11:108),]
+
+qb_names_11 <- ridge_qbs_11$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_11 <- cbind(ridge_qbs_11,qb_names_11)
+
+qb_data_frame <- as.data.frame(qbs2_2011)
+class(qb_data_frame)
+
+joined_data <- full_join(ridge_qbs_11, qb_data_frame, by = c("qb_names_11" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_11 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2011,
+                            estimate == 44444 ~ 2011))
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2011 <- qb_chart_11 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_11 <- ggplot(for_Graph_2011, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2011$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2011$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2011$qb_names_11 == "T.Brady" | for_Graph_2011$qb_names_11 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2011$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_11),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2011)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_11
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+### Will tell you when to end
+
+teams_end <- nrow(coef_2011)
+as.numeric(teams_end)
+
+ridge_teams_11 <- coef_2011[c(109:140),] 
+
+team_names_11 <- ridge_teams_11$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_11 <- cbind(ridge_teams_11,team_names_11)
+dchart_11 <- ridge_teams_11 %>% left_join(nfl_logos_df, by = c("team_names_11" = "team_code"))
+dchart_11 <- dchart_11 %>% left_join(Team_Pass_EPA_Defence_11, by = c("team_names_11" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2011,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_11 <- ggplot(dchart_11, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_11$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_11$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2011)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_11
+
+controls_2011 <- coef_2011[c(2:10),] 
+
+controls_graph <- ggplot(controls_2011, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2011)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+### Cleaned 2020 RAPM Code
+### Get the data, Begin Adding the Variables to the Dataset
+data_2010 <- load_pbp(2010)
+
+pbp_rp_10 <- data_2010 %>% 
+  filter(qb_dropback == 1) 
+
+pbp_rp_10 <- pbp_rp_10 %>%
+  mutate(
+    pass = if_else(str_detect(desc, "(pass)|(sacked)|(scramble)"), 1, 0),
+    rush = if_else(str_detect(desc, "(left end)|(left tackle)|(left guard)|(up the middle)|(right guard)|(right tackle)|(right end)") & pass == 0, 1, 0),
+    success = ifelse(epa>0, 1 , 0)
+  ) 
+
+
+### At least 50 Dropbacks
+qbs_10 <- pbp_rp_10 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 50)
+
+### All QBs
+qbsall_10 <- pbp_rp_10 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+qbsall_10
+
+
+### In Case You Want a Raw EPA Graph
+qbs_10 <- qbs_10 %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr'))
+
+### Add Control Variables to the Data
+passes_roundwp_10_adjusted <- pbp_rp_10 %>%
+  filter(season_type == "REG") %>%
+  mutate(abs_wpa = abs(wpa)) %>%
+  mutate(yards_to_go_square = ydstogo * ydstogo) %>%
+  mutate(yards_times_down = ydstogo * down) %>% 
+  mutate(wp_squared = wp^2) %>%
+  mutate(log_ydstogo = log(ydstogo)) %>%
+  mutate(yardline_squared = yardline_100^2) %>%
+  mutate(yardline_cube = yardline_100^3) %>%
+  mutate(game_Seconds_sq = game_seconds_remaining^2) %>%
+  mutate(was_first_down = case_when(down == 1 ~ 1,
+                                    down != 1 ~ 0)) %>%
+  mutate(was_second_down = case_when(down == 2 ~ 1,
+                                     down != 2 ~ 0)) %>%
+  mutate(was_third_down = case_when(down == 3 ~ 1,
+                                    down != 3 ~ 0)) %>%
+  mutate(was_fourth_down = case_when(down == 4 ~ 1,
+                                     down != 4 ~ 0)) %>%
+  mutate(fumble_was_qb = case_when(fumbled_1_player_name == passer_player_name ~ 1,
+                                   fumbled_1_player_name != passer_player_name ~ 0)) %>%
+  mutate(exper_air_yards = case_when(air_yards != "NA" ~ abs(air_yards),
+                                     air_yards == "NA" ~ abs(yards_gained))) %>%
+  filter(defteam != "NA") %>%
+  filter(passer != "NA")
+
+### ADD QB Dummy Variabels
+passes_roundwp_10_adjusted2 <- fastDummies::dummy_cols(passes_roundwp_10_adjusted$passer)
+### For Some reason the above function creates an extra row first, which we are dropping here
+passes_roundwp_10_adjusted2 <- passes_roundwp_10_adjusted2[ -c(1) ]
+passes_roundwp_10_adjusted <- cbind(passes_roundwp_10_adjusted,passes_roundwp_10_adjusted2)
+
+### Add the Team Dummy Variables
+passes_roundwp_10_adjusted3 <- fastDummies::dummy_cols(passes_roundwp_10_adjusted$defteam)
+passes_roundwp_10_adjusted3 <- passes_roundwp_10_adjusted3[ -c(1) ]
+
+passes_roundwp_10_adjusted <- cbind(passes_roundwp_10_adjusted,passes_roundwp_10_adjusted3)
+
+
+### Back To the Analysis 
+passes_roundwp_10_adjusted$fumble_was_qb[is.na(passes_roundwp_10_adjusted$fumble_was_qb)] <- 0
+
+
+### Filter Out potential Weird NA's in the Analysis 
+for_epa_valid_passes10 <- passes_roundwp_10_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+passes_roundwp_10_adjusted_no_twos <- passes_roundwp_10_adjusted %>%
+  filter(down != "NA") %>%
+  filter(epa != "NA") %>%
+  filter(passer != "NA")
+
+### Just EPA (The target Variable)
+passing_epa_table10 <- passes_roundwp_10_adjusted %>%
+  filter(down != "NA") %>%
+  filter(passer != "NA") %>% 
+  filter(epa != "NA") %>%
+  select(epa)
+
+### Back to normal code
+qbs_2010 <- passes_roundwp_10_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+### Get Interception and Fumble Data
+pick_data10 <- passes_roundwp_10_adjusted_no_twos %>%
+  filter(interception == 1) 
+
+fumble_Data10 <- passes_roundwp_10_adjusted_no_twos %>%
+  filter(fumble_was_qb == 1)
+
+average_pick_epa10 <- mean(pick_data10$epa)
+average_fumble_Epa10 <- mean(fumble_Data10$epa)
+
+
+
+### Adjust EPA For the Fumbles
+adjusted_epa_to_picks10 <- passes_roundwp_10_adjusted_no_twos %>%
+  mutate(epa_new = case_when(interception == 1 ~ average_pick_epa10,
+                             interception != 1 ~ qb_epa)) 
+
+adjusted_epa_again_10 <- adjusted_epa_to_picks10 %>%
+  mutate(epa_new2 = case_when(fumble_was_qb == 1 ~ average_fumble_Epa10,
+                              fumble_was_qb != 1 ~ epa_new))
+
+
+### Now EPA New 2 is the target Variable it doesn't punish QBs for Turnover Varience
+
+qbs2_2010 <- passes_roundwp_10_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(id, name) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  ungroup() %>%
+  filter(n_dropbacks > 0)
+
+used_qbs_10 <- qbs2_2010 %>%
+  filter(n_dropbacks >=50) %>%
+  filter(name != "NA")
+
+used_qbs_10 <- qbs_2010 %>%
+  filter(n_dropbacks >=1) %>%
+  filter(name != "NA")
+
+Team_Pass_EPA_Defence_10 <- passes_roundwp_10_adjusted_no_twos %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  filter(pass == 1) %>%
+  group_by(defteam) %>%
+  summarise(
+    num_db = n(), 
+    epa_per_db = sum(epa) / num_db,
+    success_rate = sum(epa < 0) / num_db
+  )
+
+### 
+number_of_Vars <- length(adjusted_epa_again_10)
+number_of_Vars <- as.numeric(number_of_Vars)
+
+### Watch the length of the datafrae. Note this is where you get all your control variables
+info_about_passes_try_10 <- adjusted_epa_again_10[,c(23,26,31:32,377,381:384,387:
+                                                       #### Update the 525 to whatever number the number of VARS
+                                                       ### THing gives us, subtract 2, so at 525, do 523
+                                                       521)]
+passing_epa_table10 <- adjusted_epa_again_10 %>%
+  select(epa_new2)
+
+try <- as.vector(passing_epa_table10)
+try1 <- as.vector(info_about_passes_try_10)
+
+try2 = as.matrix(as.data.frame(lapply(try1, as.numeric)))
+try3 = as.matrix(as.data.frame(lapply(try, as.numeric)))
+
+lambdas_to_try <- 10^seq(-3, 5, length.out = 100)
+
+check <- sd(passing_epa_table10$epa_new2)
+
+### Note add ,weights = try4, to get weighted by win probability added
+fit <- glmnet(try2,try3, alpha = 0, 
+              ### weights = try4, 
+              lambda  = lambdas_to_try)
+
+summary(fit)
+
+
+ridge_cv <- cv.glmnet(try2,try3,
+                      ### weights = try4, 
+                      alpha = 0, nfolds = 10)
+
+best_lambda_10 <- ridge_cv$lambda.min
+best_lambda_10
+
+best_fit <- ridge_cv$glmnet.fit
+head(best_fit)
+
+### Note add ,weights = try4, to get weighted by win probability added
+best_ridge_10 <- glmnet(try2,try3,
+                        ### weights = try4, 
+                        alpha = 0, lambda = best_lambda_10)
+
+coef(best_ridge_10)
+
+### Gets your coefficents
+coef_2010 <- tidy(best_ridge_10)
+
+### Will have to find where the QBs end and the Teams Start Manually
+teams_start <- nrow(coef_2010)
+### Will tell you the number to input to get the QB coefficents
+as.numeric(teams_start) - 32
+
+ridge_qbs_10 <- coef_2010[c(11:113),]
+
+qb_names_10 <- ridge_qbs_10$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_10 <- cbind(ridge_qbs_10,qb_names_10)
+
+qb_data_frame <- as.data.frame(qbs2_2010)
+class(qb_data_frame)
+
+### For Later
+nfl_logos_df <- read_csv("https://raw.githubusercontent.com/statsbylopez/BlogPosts/master/nfl_teamlogos.csv")
+
+joined_data <- full_join(ridge_qbs_10, qb_data_frame, by = c("qb_names_10" = "name"))
+
+### Get team color for QB Graphs
+qb_chart_10 <- joined_data %>%
+  left_join(teams_colors_logos, by = c('team' = 'team_abbr')) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2010,
+                            estimate == 44444 ~ 2011))
+
+
+
+
+### Only include QBs with a reasonable sample size for graph
+for_Graph_2010 <- qb_chart_10 %>%
+  filter(n_dropbacks > 99)
+
+qb_graph_10 <- ggplot(for_Graph_2010, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(for_Graph_2010$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(for_Graph_2010$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(for_Graph_2010$qb_names_10 == "T.Brady" | for_Graph_2010$qb_names_10 == "A.Rodgers", "red", "black"), 
+             ### Remember to change this
+             cex=for_Graph_2010$n_plays/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_10),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Adjusted QB Passing EPA Per Play (2010)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+qb_graph_10
+
+
+### Will tell you the number to input to get the team coefficents
+as.numeric(teams_start) - 31
+
+### Will tell you when to end
+
+teams_end <- nrow(coef_2010)
+as.numeric(teams_end)
+
+ridge_teams_10 <- coef_2010[c(114:145),] 
+
+team_names_10 <- ridge_teams_10$term %>%
+  str_remove_all(".data_")
+
+ridge_teams_10 <- cbind(ridge_teams_10,team_names_10)
+dchart_10 <- ridge_teams_10 %>% left_join(nfl_logos_df, by = c("team_names_10" = "team_code"))
+dchart_10 <- dchart_10 %>% left_join(Team_Pass_EPA_Defence_10, by = c("team_names_10" = "defteam")) %>%
+  mutate(Season = case_when(estimate != 44444 ~ 2010,
+                            estimate == 44444 ~ 2011))
+
+adjusted_epa_d_10 <- ggplot(dchart_10, aes(x=success_rate,y=estimate)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(dchart_10$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(dchart_10$success_rate), color = "red", linetype = "dashed") +
+  labs(x = "Success Rate",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Passing EPA Per Play (2020)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_10
+
+
+controls_2010 <- coef_2010[c(2:10),] 
+
+controls_graph <- ggplot(controls_2010, aes(x=estimate,y=dev.ratio)) +
+  geom_vline(xintercept =  0, color = "red", linetype = "dashed") +
+  geom_point() +
+  geom_text_repel(aes(label=term),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y="No Meaning",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Effect of Control Variables on EPA Per Play (2020)") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+controls_graph
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+### Start Joining the Other Datasets
+glimpse(first_qb)
+
+first_qb <- left_join(qb_chart_20, qb_chart_19, by = "term") %>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+
+first_qb2 <- left_join(qb_chart_19, qb_chart_18, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb3 <- left_join(qb_chart_18, qb_chart_17, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb4 <- left_join(qb_chart_17, qb_chart_16, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb5 <- left_join(qb_chart_16, qb_chart_15, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb6 <- left_join(qb_chart_15, qb_chart_14, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb7 <- left_join(qb_chart_14, qb_chart_13, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb8 <- left_join(qb_chart_13, qb_chart_12, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb9 <- left_join(qb_chart_12, qb_chart_11, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+first_qb10 <- left_join(qb_chart_11, qb_chart_10, by = "term")%>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+
+first_qb11 <- left_join(qb_chart_21, qb_chart_20, by = "term") %>%
+  select(term,estimate.x,lambda.x,epa.x,cpoe.x,n_dropbacks.x,team_name.x,Season.x,
+         estimate.y,lambda.y,epa.y,cpoe.y,n_dropbacks.y,team_name.x,team_name.y,Season.y)
+
+
+
+full_yoy <- rbind(first_qb,first_qb2,first_qb3,first_qb4,first_qb5,first_qb6,first_qb7,
+        first_qb8,first_qb9,first_qb10,first_qb11) %>%
+  mutate(total_dbs = n_dropbacks.x + n_dropbacks.y) %>%
+  filter(n_dropbacks.x > 1) %>%
+  filter(n_dropbacks.y > 1) %>%
+  mutate(Same_Team = case_when(team_name.x == team_name.y ~ 1,
+                               team_name.y == team_name.y ~ 0))
+
+
+
+changed_team <- full_yoy %>%
+  filter(Same_Team == 0) %>%
+  filter(n_dropbacks.x > 99) %>%
+  filter(n_dropbacks.y > 99)
+
+
+glimpse(full_yoy)
+
+filtered_yoy <- full_yoy %>%
+  filter(epa.x != "NA") %>%
+  filter(epa.y != "NA") %>%
+  filter(estimate.x != "NA") %>%
+  filter(estimate.y != "NA") %>%
+  filter(n_dropbacks.x > 49) %>%
+  filter(n_dropbacks.y > 49)
+
+
+glimpse(full_yoy)
+
+regression_of_it <- lm(data = filtered_yoy,epa.x ~ estimate.y)
+summary(regression_of_it)
+
+regression_of_it <- lm(data = filtered_yoy,epa.x ~ epa.y)
+summary(regression_of_it)
+
+regression_of_it <- lm(data = filtered_yoy,estimate.x ~ estimate.y)
+summary(regression_of_it)
+
+regression_of_it <- lm(data = filtered_yoy,epa.x ~ estimate.y, weights = total_dbs)
+summary(regression_of_it)
+
+regression_of_it <- lm(data = filtered_yoy,epa.x ~ epa.y, weights = total_dbs)
+summary(regression_of_it)
+
+
+regression_of_it <- lm(data = filtered_yoy,estimate.x ~ estimate.y, weights = total_dbs)
+summary(regression_of_it)
+
+
+
+
+yoy_graph <- ggplot(filtered_yoy, aes(x=estimate.y,y=epa.x)) +
+  geom_vline(xintercept =  mean(filtered_yoy$estimate.y), color = "red", linetype = "dashed") +
+  geom_hline(yintercept =  mean(filtered_yoy$epa.x), color = "red", linetype = "dashed") +
+  geom_point() +
+  labs(x = "Isolated EPA Per Dropback Year X",
+       y="EPA Per Dropback Year X + 1",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Previous Isolated EPA Vs. Future EPA",
+       subtitle = "QB Dropbacks Only. Minimum 50 Dropbacks Each Season") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5)) +
+  geom_smooth(method = "lm")
+
+yoy_graph
+
+
+yoy_graph2 <- ggplot(filtered_yoy, aes(x=epa.y,y=epa.x)) +
+  geom_vline(xintercept =  mean(filtered_yoy$estimate.y), color = "red", linetype = "dashed") +
+  geom_hline(yintercept =  mean(filtered_yoy$epa.x), color = "red", linetype = "dashed") +
+  geom_point() +
+  labs(x = "Isolated EPA Per Dropback Year X",
+       y="EPA Per Dropback Year X + 1",
+       caption = "Data from nflfastR, Model By @CMHockey66",
+       title = "Previous Isolated EPA Vs. Future EPA",
+       subtitle = "QB Dropbacks Only. Minimum 50 Dropbacks Each Season") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5)) +
+  geom_smooth(method = "lm")
+
+yoy_graph2
+
+
+
+
+
+### Get Player Grades and Test vs PFF
+### Users will need your own PFF data for this part
+### It is paywalled so I will not be posiing it out respect
+PFF_2020 <- read.csv(file.choose())
+PFF_2019 <- read.csv(file.choose())
+PFF_2018 <- read.csv(file.choose())
+PFF_2017 <- read.csv(file.choose())
+PFF_2016 <- read.csv(file.choose())
+PFF_2015 <- read.csv(file.choose())
+
+glimpse(qb_chart_19)
+
+glimpse(PFF_2016)
+
+first_pff <- left_join(PFF_2020, qb_chart_19, by = c("name2" = "qb_names_19")) %>%
+  select(name2,attempts,grades_pass,grades_offense,qb_rating,ypa,estimate,epa,cpoe,n_dropbacks,team,team_name.x) %>%
+  filter(epa != "NA")
+
+sec_pff <- left_join(PFF_2019, qb_chart_18, by = c("name2" = "qb_names_18")) %>%
+  select(name2,attempts,grades_pass,grades_offense,qb_rating,ypa,estimate,epa,cpoe,n_dropbacks,team,team_name.x) %>%
+  filter(epa != "NA")
+
+third_pff <- left_join(PFF_2018, qb_chart_17, by = c("name2" = "qb_names_17")) %>%
+  select(name2,attempts,grades_pass,grades_offense,qb_rating,ypa,estimate,epa,cpoe,n_dropbacks,team,team_name.x) %>%
+  filter(epa != "NA")
+
+fourth_pff <- left_join(PFF_2017, qb_chart_16, by = c("name2" = "qb_names_16")) %>%
+  select(name2,attempts,grades_pass,grades_offense,qb_rating,ypa,estimate,epa,cpoe,n_dropbacks,team,team_name.x) %>%
+  filter(epa != "NA")
+
+fifth_pff <- left_join(PFF_2016, qb_chart_15, by = c("name2" = "qb_names_15")) %>%
+  select(name2,attempts,grades_pass,grades_offense,qb_rating,ypa,estimate,epa,cpoe,n_dropbacks,team,team_name.x) %>%
+  filter(epa != "NA")
+
+
+
+six_pff <- left_join(PFF_2015, qb_chart_14, by = c("name2" = "qb_names_14")) %>%
+  select(name2,attempts,grades_pass,grades_offense,qb_rating,ypa,estimate,epa,cpoe,n_dropbacks,team,team_name.x) %>%
+  filter(epa != "NA")
+
+glimpse(first_pff)
+
+regresion_next <- lm(data = six_pff, grades_pass ~ estimate)
+summary(regresion_next)
+
+regresion_next <- lm(data = six_pff, grades_pass ~ epa)
+summary(regresion_next)
+
+
+
+### Big PFF
+master_pff_Grade <- rbind(first_pff,sec_pff,third_pff,fourth_pff,fifth_pff,six_pff) %>%
+  mutate(total_attempts = attempts + n_dropbacks)
+
+
+regresion_next <- lm(data = master_pff_Grade, grades_pass ~ estimate, weights = total_attempts)
+summary(regresion_next)
+
+regresion_next <- lm(data = master_pff_Grade, grades_pass ~ epa, weights = total_attempts)
+summary(regresion_next)
+
+
+filtered_pff_Grade <- master_pff_Grade %>%
+  filter(attempts > 49) %>%
+  filter(n_dropbacks > 49)
+
+regresion_next <- lm(data = filtered_pff_Grade, grades_pass ~ estimate, weights = total_attempts)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, grades_pass ~ epa, weights = total_attempts)
+summary(regresion_next)
+
+
+regresion_next <- lm(data = filtered_pff_Grade, grades_pass ~ estimate)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, grades_pass ~ epa)
+summary(regresion_next)
+
+
+### Do the same with Passer Rating
+regresion_next <- lm(data = filtered_pff_Grade, qb_rating ~ estimate, weights = total_attempts)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, qb_rating ~ epa, weights = total_attempts)
+summary(regresion_next)
+
+
+regresion_next <- lm(data = filtered_pff_Grade, qb_rating ~ estimate)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, qb_rating ~ epa)
+summary(regresion_next)
+
+
+
+#### Offence Grade   
+regresion_next <- lm(data = filtered_pff_Grade, grades_offense ~ estimate, weights = total_attempts)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, grades_offense ~ epa, weights = total_attempts)
+summary(regresion_next)
+
+
+regresion_next <- lm(data = filtered_pff_Grade, grades_offense ~ estimate)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, grades_offense ~ epa)
+summary(regresion_next)
+
+
+
+### YPA
+regresion_next <- lm(data = filtered_pff_Grade, ypa ~ estimate, weights = total_attempts)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, ypa ~ epa, weights = total_attempts)
+summary(regresion_next)
+
+
+regresion_next <- lm(data = filtered_pff_Grade, ypa ~ estimate)
+summary(regresion_next)
+
+regresion_next <- lm(data = filtered_pff_Grade, ypa ~ epa)
+summary(regresion_next)
+
+
+
+
+
+
+
+
+
+
+### Back to normal programming
+### Done Year Over Year Testing
+glimpse(qb_chart_20)
+
+qb_chart_21_2 <- qb_chart_21 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_20_2 <- qb_chart_20 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_19_2 <- qb_chart_19 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_18_2 <- qb_chart_18 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_17_2 <- qb_chart_17 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_16_2 <- qb_chart_16 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_15_2 <- qb_chart_15 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_14_2 <- qb_chart_14 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_13_2 <- qb_chart_13 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_12_2 <- qb_chart_12 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_11_2 <- qb_chart_11 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+qb_chart_10_2 <- qb_chart_10 %>%
+  select(term,estimate,epa,cpoe,n_dropbacks,team,Season)
+
+
+glimpse(qb_chart_20_2)
+
+master_data_set <- rbind(qb_chart_21_2,qb_chart_20_2,qb_chart_19_2,qb_chart_18_2,qb_chart_17_2,qb_chart_16_2,
+                         qb_chart_15_2,qb_chart_14_2,qb_chart_13_2,qb_chart_12_2,qb_chart_11_2,
+                         qb_chart_10_2) %>%
+  mutate(isolated_epa = estimate*n_dropbacks)
+
+
+
+
+
+qb_names_decade <- master_data_set$term %>%
+  str_remove_all(".data_")
+
+yoy_qbs <- cbind(master_data_set,qb_names_decade) %>%
+  filter(qb_names_decade != "NA") %>%
+  filter(epa != "NA")
+
+
+filter_yoy <- yoy_qbs %>%
+  filter(n_dropbacks > 249)
+
+
+sd_iso <- sd(filter_yoy$estimate)
+av_iso <- mean(filter_yoy$estimate)
+
+0 + sd_iso
+0 - sd_iso 
+
+
+
+glimpse(yoy_qbs)
+
+
+by_player_decade <- master_data_set %>%
+  group_by(term) %>%
+  summarise(total_plays = sum(n_dropbacks),
+            total_iso_epa = sum(isolated_epa),
+            mean_cpoe = mean(cpoe)) %>%
+  mutate(iso_epa_play = total_iso_epa / total_plays) %>%
+  filter(total_plays > 1000)
+
+
+
+
+
+
+qb_names_decade <- by_player_decade$term %>%
+  str_remove_all(".data_")
+
+ridge_qbs_decade <- cbind(by_player_decade,qb_names_decade) %>%
+  filter(qb_names_decade != "NA")
+
+glimpse(ridge_qbs_decade)
+
+qb_graph_10 <- ggplot(ridge_qbs_decade, aes(x=total_plays,y=total_iso_epa)) +
+  geom_hline(yintercept = mean(ridge_qbs_decade$total_iso_epa), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(ridge_qbs_decade$total_plays), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(ridge_qbs_decade$qb_names_decade == "T.Brady" | ridge_qbs_decade$qb_names_decade == "A.Rodgers" | ridge_qbs_decade$qb_names_decade == "P.Manning" | ridge_qbs_decade$qb_names_decade == "P.Mahomes", "red", "black"), 
+             ### Remember to change this
+             cex=ridge_qbs_decade$total_plays/600, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_decade),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Pass Attempts in Sample",
+       y="Cummulative Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66. Dropbacks Only. Dot Size Increasing With Sample Size",
+       title = "2010-2021 Isolated QB EPA Per Play",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust = 0.5))
+
+
+qb_graph_10
+
+
+
+qb_graph_10 <- ggplot(ridge_qbs_decade, aes(x=mean_cpoe,y=iso_epa_play)) +
+  geom_hline(yintercept = mean(ridge_qbs_decade$iso_epa_play), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(ridge_qbs_decade$mean_cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(ridge_qbs_decade$qb_names_decade == "J.Herbert" | ridge_qbs_decade$qb_names_decade == "J.Burrow" | ridge_qbs_decade$qb_names_decade == "D.Jones" | ridge_qbs_decade$qb_names_decade == "L.Jackson", "red", "black"), 
+             ### Remember to change this
+             cex=ridge_qbs_decade$total_plays/600, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_decade),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "Mean CPOE by Season",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66. Dot Size Increasing With Sample Size",
+       title = "Isolated QB EPA Per Play (2010-2021. Dropbacks Only)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust = 0.5))
+
+
+qb_graph_10
+
+
+qbs_for_graph <- yoy_qbs %>%
+  filter(qb_names_decade == "B.Roethlisberger" | qb_names_decade == "P.Rivers")
+
+data_over_time <- ggplot(qbs_for_graph, aes(x = Season, y = estimate, colour = qb_names_decade)) +
+  geom_line() +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0.07282966, color = "black", linetype = "dashed") +
+  geom_hline(yintercept = -0.07282966, color = "black", linetype = "dashed") +
+  geom_point() +
+  labs(x = "Season",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66. Black Lines Represent 1 Standard Deviation Above / Below Average
+       ",
+       title = "Isolated QB EPA Per Play (2010-2020. Dropbacks Only)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+  
+
+data_over_time
+
+
+qbs_for_graph <- yoy_qbs %>%
+  filter(qb_names_decade == "T.Brady" | qb_names_decade == "A.Rodgers" | qb_names_decade == "P.Mahomes")
+
+data_over_time <- ggplot(qbs_for_graph, aes(x = Season, y = estimate, colour = qb_names_decade)) +
+  geom_line() +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_hline(yintercept = 0.07282966, color = "black", linetype = "dashed") +
+  geom_hline(yintercept = -0.07282966, color = "black", linetype = "dashed") +
+  geom_point() +
+  labs(x = "Season",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66. Black Lines Represent 1 Standard Deviation Above / Below Average
+       ",
+       title = "Isolated QB EPA Per Play (2010-2021. Dropbacks Only)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+
+data_over_time
+
+glimpse(yoy_qbs)
+
+
+### Minimum 100 Attempts
+rookie_qbs <- yoy_qbs %>%
+  filter(qb_names_decade == "M.Jones" & Season == 2021 | 
+           qb_names_decade == "Z.Wilson" & Season == 2021 |
+           qb_names_decade == "T.Lawrence" & Season == 2021 | 
+           qb_names_decade == "J.Fields" & Season == 2021 |
+           qb_names_decade == "D.Mills" & Season == 2021 | 
+           qb_names_decade == "J.Herbert" & Season == 2020 |
+           qb_names_decade == "J.Burrow" & Season == 2020 |
+           qb_names_decade == "T.Tagovailoa" & Season == 2020 |
+           qb_names_decade == "J.Hurts" & Season == 2020 |
+           qb_names_decade == "J.Luton" & Season == 2020 |
+           qb_names_decade == "K.Murray" & Season == 2019 |
+           qb_names_decade == "G.Minshew" & Season == 2019 |
+           qb_names_decade == "D.Jones" & Season == 2019 |
+           qb_names_decade == "D.Haskins" & Season == 2019 |
+           qb_names_decade == "D.Blough" & Season == 2019 |
+           qb_names_decade == "D.Hodges" & Season == 2019 |
+           qb_names_decade == "D.Lock" & Season == 2019 | 
+           qb_names_decade == "B.Mayfield" & Season == 2018 | 
+           qb_names_decade == "S.Darnold" & Season == 2018 | 
+           qb_names_decade == "J.Rosen" & Season == 2018 | 
+           qb_names_decade == "J.Allen" & Season == 2018 | 
+           qb_names_decade == "N.Mullens" & Season == 2018 | 
+           qb_names_decade == "J.Driskel" & Season == 2018 | 
+           qb_names_decade == "L.Jackson" & Season == 2018 |
+           qb_names_decade == "D.Kizer" & Season == 2017 |
+           qb_names_decade == "M.Trubisky" & Season == 2017 |
+           qb_names_decade == "C.Beathard" & Season == 2017 |
+           qb_names_decade == "D.Watson" & Season == 2017 |
+           qb_names_decade == "C.Wentz" & Season == 2016 |
+           qb_names_decade == "D.Prescott" & Season == 2016 |
+           qb_names_decade == "J.Goff" & Season == 2016 |
+           qb_names_decade == "C.Kessler" & Season == 2016 |
+           qb_names_decade == "B.Petty" & Season == 2016 |
+           qb_names_decade == "J.Winston" & Season == 2015 |
+           qb_names_decade == "M.Mariota" & Season == 2015 |
+           qb_names_decade == "A.McCarron" & Season == 2015 |
+           qb_names_decade == "K.Moore" & Season == 2015 |
+           qb_names_decade == "D.Carr" & Season == 2014 |
+           qb_names_decade == "B.Bortles" & Season == 2014 |
+           qb_names_decade == "T.Bridgewater" & Season == 2014 |
+           qb_names_decade == "A.Davis" & Season == 2014 |
+           qb_names_decade == "Z.Mettenberger" & Season == 2014 |
+           qb_names_decade == "G.Smith" & Season == 2013 |
+           qb_names_decade == "M.Glennon" & Season == 2013 |    
+           qb_names_decade == "E.Manuel" & Season == 2013 |
+           qb_names_decade == "C.Keenum" & Season == 2013 |
+           qb_names_decade == "M.McGloin" & Season == 2013 |
+           qb_names_decade == "A.Luck" & Season == 2012 |
+           qb_names_decade == "B.Weeden" & Season == 2012 |
+           qb_names_decade == "R.Tannehill" & Season == 2012 |
+           qb_names_decade == "R.Wilson" & Season == 2012 |
+           qb_names_decade == "N.Foles" & Season == 2012 |
+           qb_names_decade == "R.Lindley" & Season == 2012 |
+           qb_names_decade == "R.Griffin III" & Season == 2012 | 
+           qb_names_decade == "C.Newton" & Season == 2011 | 
+           qb_names_decade == "A.Dalton" & Season == 2011 | 
+           qb_names_decade == "B.Gabbert" & Season == 2011 | 
+           qb_names_decade == "C.Ponder" & Season == 2011 | 
+           qb_names_decade == "S.Bradford" & Season == 2010 | 
+           qb_names_decade == "J.Clausen" & Season == 2010 | 
+           qb_names_decade == "C.McCoy" & Season == 2010 | 
+           qb_names_decade == "J.Skelon" & Season == 2010
+           ) %>%
+  mutate(Prev_Season = Season - 1)
+
+
+rookie_names <- c("T.Lawrence", "D.Mills","J.Fields","M.Jones","Z.Wilson", 
+                  "J.Burrow", "J.Herbert", "J.Hurts", "J.Luton", "T.Tagovailoa" ,
+                  "D.Blough" ,"D.Haskins" ,"D.Hodges" ,"D.Jones" ,"D.Lock" ,"K.Murray" ,
+                  "B.Mayfield" ,"J.Allen" ,"J.Driskel" ,"J.Rosen" ,"L.Jackson" ,"N.Mullens" ,"S.Darnold" ,
+                  "C.Beathard" ,"D.Kizer" ,"D.Watson" ,"M.Trubisky"
+                  ,"B.Petty" ,"C.Kessler" ,"C.Wentz" ,"D.Prescott" ,"J.Goff" ,
+                  "A.McCarron" ,"J.Winston" ,"K.Moore" ,"M.Mariota" ,
+                  "A.Davis" ,"B.Bortles" ,"D.Carr" ,"T.Bridgewater" ,"Z.Mettenberger" ,
+                  "C.Keenum" ,"E.Manuel" ,"G.Smith" ,"M.Glennon" ,"M.McGloin" ,
+                  "A.Luck" ,"B.Weeden" ,"N.Foles" ,"R.Lindley" ,"R.Tannehill" ,"R.Wilson" ,
+                  "A.Dalton" ,"B.Gabbert" ,"C.Newton" ,"C.Ponder",
+                  "C.McCoy", "J.Clausen", "S.Bradford")
+
+
+
+
+
+
+rookie_dp <- c(1, 67, 11, 15, 2,
+               1, 6, 53, 189, 5, 
+               NA, 15, NA, 6, 42, 1,
+               1, 7, 207, 10, 32, NA, 3,
+               104, 52, 12, 2, 
+               103, 93, 2, 135, 1,
+               164, 1, NA, 2,
+               NA, 3, 36, 32, 178,
+               NA, 16, 39, 73, NA,
+               1, 22, 88, 185, 8, 75, 
+               35, 10, 1, 12,
+               85, 48, 1
+)
+
+
+
+rookie_dp_name_df <- data.frame(rookie_names,rookie_dp)
+
+
+rookie_qbs_withdp <- left_join(rookie_qbs, rookie_dp_name_df, by = c("qb_names_decade" = "rookie_names"))
+
+regression_dp <- lm(data = rookie_qbs_withdp, estimate ~ rookie_dp)
+summary(regression_dp)
+
+
+first_rounders <- rookie_qbs_withdp %>%
+  filter(rookie_dp < 33)
+
+regression_dp <- lm(data = first_rounders, estimate ~ rookie_dp)
+summary(regression_dp)
+
+
+summary(regression_dp)
+
+glimpse(rookie_qbs)
+
+
+glimpse(rookie_qbs_withdp)
+
+###
+rookies_2018 <- rbind(data_2021,data_2020,data_2019) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2017 <- rbind(data_2020,data_2019,data_2018) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2016 <- rbind(data_2019,data_2018,data_2017) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2015 <- rbind(data_2018,data_2017,data_2016) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2014 <- rbind(data_2017,data_2016,data_2015) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2013 <- rbind(data_2016,data_2015,data_2014) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2012 <- rbind(data_2015,data_2014,data_2013) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2011 <- rbind(data_2014,data_2013,data_2012) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+rookies_2010 <- rbind(data_2013,data_2012,data_2011) %>%
+  filter(qb_dropback == 1) %>%
+  filter(epa != "NA")
+
+### QB Data
+QB_2019_21 <- rookies_2018 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2018) %>%
+  filter(n_dropbacks > 4)
+
+QB_2018_20 <- rookies_2017 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2017) %>%
+  filter(n_dropbacks > 4)
+
+QB_2017_19 <- rookies_2016 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2016) %>%
+  filter(n_dropbacks > 4)
+
+QB_2016_18 <- rookies_2015 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2015) %>%
+  filter(n_dropbacks > 4)
+
+QB_2015_17 <- rookies_2014 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2014) %>%
+  filter(n_dropbacks > 4)
+
+QB_2014_16 <- rookies_2013 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2013) %>%
+  filter(n_dropbacks > 4)
+
+QB_2013_15 <- rookies_2012 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2012) %>%
+  filter(n_dropbacks > 4)
+
+QB_2012_14 <- rookies_2011 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2011) %>%
+  filter(n_dropbacks > 4)
+
+
+QB_2011_13 <- rookies_2010 %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(passer) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(DY = 2010) %>%
+  filter(n_dropbacks > 4)
+
+
+master_3_year_for_rooks <- rbind(QB_2018_20,QB_2017_19,QB_2016_18,QB_2015_17,QB_2014_16,
+                                 QB_2013_15,QB_2012_14,QB_2011_13)
+
+
+
+
+rookie_now_to_future <- left_join(rookie_qbs_withdp,master_3_year_for_rooks, by = c("qb_names_decade" = "passer", "Season" = "DY"))
+glimpse(rookie_now_to_future)
+
+
+filtered_rookie_now_to_future <- rookie_now_to_future %>%
+  filter(n_dropbacks.y > 49)
+
+glimpse(filtered_rookie_now_to_future)
+
+rookie_regression <- lm(data = filtered_rookie_now_to_future, epa.y ~ estimate, weights = n_plays)
+summary(rookie_regression)
+
+rookie_regression2 <- lm(data = filtered_rookie_now_to_future, epa.y ~ epa.x, weights = n_plays)
+summary(rookie_regression2)
+
+
+
+### Team Efficinecy
+Teams_2020 <- pbp_rp_20 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2020)
+
+Teams_2019 <- pbp_rp_19 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2019)
+
+Teams_2018 <- pbp_rp_18 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2018)
+
+Teams_2017 <- pbp_rp_17 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2017)
+
+
+Teams_2016 <- pbp_rp_16 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2016)
+
+
+Teams_2015 <- pbp_rp_15 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2015)
+
+Teams_2014 <- pbp_rp_14 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2014)
+
+Teams_2013 <- pbp_rp_13 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2013)
+
+
+
+Teams_2012 <- pbp_rp_12 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2012)
+
+Teams_2011 <- pbp_rp_11 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2011)
+
+Teams_2010 <- pbp_rp_10 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2010)
+
+data_2009 <- load_pbp(2009)
+
+pbp_rp_09 <- data_2009 %>% 
+  filter(qb_dropback == 1)
+
+Teams_2009 <- pbp_rp_09 %>%
+  filter(qb_dropback == 1) %>%
+  filter(season_type == "REG", !is.na(epa)) %>%
+  group_by(posteam) %>%
+  summarize(
+    epa = mean(qb_epa),
+    cpoe = mean(cpoe, na.rm = T),
+    n_dropbacks = sum(pass),
+    n_plays = n(),
+    team = last(posteam)
+  ) %>%
+  mutate(Season = 2009)
+
+team_epas <- rbind(Teams_2020, Teams_2019,Teams_2018, Teams_2017, Teams_2016,Teams_2015,
+                   Teams_2014,Teams_2013,Teams_2012,Teams_2011,Teams_2010,Teams_2009)
+
+glimpse(rookie_qbs_withdp)
+
+rookie_qbs_withdp_2 <- left_join(rookie_qbs_withdp, team_epas,
+                                 by = c("team" = "posteam",
+                                        "Prev_Season" = "Season"))
+glimpse(rookie_qbs_withdp_2)
+
+rookie_qbs_withdp_2_first <- rookie_qbs_withdp_2 %>%
+  filter(rookie_dp < 33)
+
+
+regression_dp <- lm(data = rookie_qbs_withdp_2, epa.x ~ epa.y + rookie_dp + cpoe.y)
+summary(regression_dp)
+
+
+
+
+
+rookie_qb_graph <- ggplot(rookie_qbs, aes(x=cpoe,y=estimate)) +
+  geom_hline(yintercept = mean(rookie_qbs$estimate), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(rookie_qbs$cpoe), color = "red", linetype = "dashed") +
+  geom_point(color = ifelse(rookie_qbs$qb_names_decade == "M.Jones" | 
+                              rookie_qbs$qb_names_decade == "T.Lawrence" |
+                              rookie_qbs$qb_names_decade == "Z.Wilson" |
+                              rookie_qbs$qb_names_decade == "D.Mills" |
+                              rookie_qbs$qb_names_decade == "J.Fields"
+                              , "red", "black"), 
+             ### Remember to change this
+             cex=rookie_qbs$n_dropbacks/60, alpha=1/4) +
+  geom_text_repel(aes(label=qb_names_decade),
+                  force=1, point.padding=0.04,
+                  segment.size=0.1) +
+  labs(x = "CPOE",
+       y="Isolated EPA Per Play",
+       caption = "Data from nflfastR, Model By @CMHockey66. Min 100 Dropbacks. Dot Size is # of Dropbacks",
+       title = "Rookie Isolated QB Dropback EPA Per Play 2010-2021",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust=0.5))
+
+
+rookie_qb_graph
+
+
+
+
+
+
+
+
+
+
+#### Now onto the defensive variables
+glimpse(dchart_15)
+
+glimpse(team_1)
+
+
+glimpse(dchart_20)
+glimpse(dchart_21)
+
+### Was Broken for some reason will have to fix later
+team <- left_join(dchart_21, dchart_20, by = "term") %>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+
+
+team_1 <- left_join(dchart_20, dchart_19, by = "term") %>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_2 <- left_join(dchart_19, dchart_18, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_3 <- left_join(dchart_18, dchart_17, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_4 <- left_join(dchart_17, dchart_16, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+
+team_5 <- left_join(dchart_16, dchart_15, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_6 <- left_join(dchart_15, dchart_14, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_7 <- left_join(dchart_14, dchart_13, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_8 <- left_join(dchart_13, dchart_12, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_9 <- left_join(dchart_12, dchart_11, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+team_10 <- left_join(dchart_11, dchart_10, by = "term")%>%
+  select(term,estimate.x,team.x,url.x,num_db.x,epa_per_db.x,success_rate.x,Season.x,
+         estimate.y,epa_per_db.y,success_rate.y,Season.y)
+
+
+master_team <- rbind(team,team_1,team_2,team_3,team_4,team_5,team_6,team_7,team_8,team_9,team_10)
+
+
+#### Offence Grade   
+regresion_next <- lm(data = master_team, epa_per_db.x ~ estimate.y)
+summary(regresion_next)
+
+regresion_next <- lm(data = master_team, epa_per_db.x ~ epa_per_db.y)
+summary(regresion_next)
+
+
+#### Offence Grade   
+regresion_next <- lm(data = master_team, success_rate.x ~ estimate.y)
+summary(regresion_next)
+
+regresion_next <- lm(data = master_team, success_rate.x ~ epa_per_db.y)
+summary(regresion_next)
+
+glimpse(dchart_20)
+
+dchart_21_2 <- dchart_21 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_20_2 <- dchart_20 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_19_2 <- dchart_19 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_18_2 <- dchart_18 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_17_2 <- dchart_17 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_16_2 <- dchart_16 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_15_2 <- dchart_15 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_14_2 <- dchart_14 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_13_2 <- dchart_13 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_12_2 <- dchart_12 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_11_2 <- dchart_11 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+dchart_10_2 <- dchart_10 %>%
+  select(term,estimate,epa_per_db,success_rate,num_db,team,Season)
+
+
+master_team <- rbind(dchart_21_2,dchart_20_2,dchart_19_2,dchart_18_2,dchart_17_2,
+                     dchart_16_2,
+                     dchart_15_2,
+                     dchart_14_2,dchart_13_2,dchart_12_2,dchart_11_2,
+                     dchart_10_2) %>%
+  mutate(isolated_epa = estimate*num_db)
+
+
+team_names <- master_team$term %>%
+  str_remove_all(".data_")
+
+yoy_teams <- cbind(master_team,team_names)
+
+by_team_decade <- yoy_teams %>%
+  group_by(term) %>%
+  summarise(total_plays = sum(num_db),
+            total_iso_epa = sum(isolated_epa),
+            mean_success = mean(success_rate)) %>%
+  mutate(iso_epa_play = total_iso_epa / total_plays) 
+
+
+team_names <- by_team_decade$term %>%
+  str_remove_all(".data_")
+
+by_team_decade <- cbind(by_team_decade,team_names)
+
+
+by_team_decade <- by_team_decade %>% left_join(nfl_logos_df, by = c("team_names" = "team_code"))
+
+glimpse(by_team_decade)
+
+adjusted_epa_d_decade <- ggplot(by_team_decade, aes(x=mean_success,y=total_iso_epa)) +
+  geom_image(aes(image=url),size = 0.06) +
+  geom_hline(yintercept = mean(by_team_decade$total_iso_epa), color = "red", linetype = "dashed") +
+  geom_vline(xintercept =  mean(by_team_decade$mean_success), color = "red", linetype = "dashed") +
+  labs(x = "Average Season Success Rate",
+       y="Cummulative Isolated EPA Per Play",
+       caption = "Data from nflscrapR, model @CMhockey66",
+       title = "Best Pass Defence's of the Decade (2010-2021)",
+       subtitle = "Adjusted For Opponent, Down, Distance, Shotgun/No Huddle and Goal Field Position When Throwing") +
+  scale_y_reverse() + 
+  theme_bw() + 
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5))
+
+adjusted_epa_d_decade
+
+
+
+### Have to Test the Control Variables too
+
+control_1 <- left_join(controls, controls_2020, by = "term")
+control_2 <- left_join(controls_2020, controls_2019, by = "term")
+control_3 <- left_join(controls_2019, controls_2018, by = "term")
+control_4 <- left_join(controls_2018, controls_2017, by = "term")
+control_5 <- left_join(controls_2017, controls_2016, by = "term")
+control_6 <- left_join(controls_2016, controls_2015, by = "term")
+control_7 <- left_join(controls_2015, controls_2014, by = "term")
+control_8 <- left_join(controls_2014, controls_2013, by = "term")
+control_9 <- left_join(controls_2013, controls_2012, by = "term")
+control_10 <- left_join(controls_2012, controls_2011, by = "term")
+control_11 <- left_join(controls_2011, controls_2010, by = "term")
+
+master_control <- rbind(control_1,control_2,control_3,control_4,control_5,control_6,
+                        control_7,control_8,control_9,control_10,control_11) %>%
+  mutate(yoy_delta = estimate.x - estimate.y)
+
+
+master_control_not_yoy <- rbind(controls,controls_2020,controls_2019,controls_2018,controls_2017,
+                                controls_2016,controls_2015,controls_2014,controls_2013,controls_2012,
+                                controls_2011,controls_2010)
+
+
+no_fourths <- master_control %>%
+  filter(term != "was_fourth_down")
+
+control_repeat <- lm(data = master_control, estimate.x ~ estimate.y)
+summary(control_repeat)
+
+control_repeat <- lm(data = no_fourths, estimate.x ~ estimate.y)
+summary(control_repeat)
+
+
+cummulative_epa_Effect <- master_control_not_yoy %>%
+  group_by(term) %>%
+  summarise(Total_Estimate = sum(estimate),
+            Mean_Estimate = Total_Estimate / 12,
+            standard_dev = sd(estimate)) %>%
+  mutate(Plus_One_Error = Mean_Estimate + standard_dev) %>%
+  mutate(Minus_One_Error = Mean_Estimate - standard_dev)
+  
+
+### The log of yards to go and the goal to go variable each flip signs one time
+yoy_controls <- ggplot(no_fourths, aes(x = estimate.x, y = estimate.y)) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  geom_point(aes(color = term)) +
+  geom_smooth(method = "lm")  +
+  theme_bw() +
+  labs(x = "Estimated Impact on EPA Per Play Year X + 1",
+       y = "Estimated Impact on EPA Per Play Year X",
+       title = "Year over Year Repeatability of Isolated EPA's Control Variables",
+       subtitle = "No Fourth Down Control Variable in Image. R Squared ~ 0.762",
+       caption = "Data from NFLfastR, Model @CMHockey66") +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust=0.5))
+
+yoy_controls
+
+yoy_controls2 <- ggplot(master_control, aes(x = estimate.x, y = estimate.y)) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  geom_point(aes(color = term)) +
+  geom_smooth(method = "lm")  +
+  theme_bw() +
+  labs(x = "Estimated Impact on EPA Per Play Year X + 1",
+       y = "Estimated Impact on EPA Per Play Year X",
+       title = "Year over Year Repeatability of Isolated EPA's Control Variables",
+       subtitle = "No Fourth Down Control Variable in Image. R Squared ~ 0.4086",
+       caption = "Data from NFLfastR, Model @CMHockey66") +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust=0.5))
+
+yoy_controls2
+
+library(ggridges)
+
+reordered_term <- master_control_not_yoy %>%
+  mutate(Term = as.factor(term))
+
+reordered_term$Term <- factor(reordered_term$Term, 
+                              levels = c("was_first_down", "was_second_down", "no_huddle",
+                                         "ydstogo", "log_ydstogo", "goal_to_go",
+                                         "shotgun", "was_third_down", "was_fourth_down"))
+
+reordered_term$Term <- factor(reordered_term$Term, 
+                              levels = c("was_fourth_down", "was_third_down", "shotgun",
+                                         "goal_to_go", "log_ydstogo", "ydstogo",
+                                         "no_huddle", "was_second_down", "was_first_down"))
+
+
+control_ridge <- ggplot(reordered_term, aes(x = estimate, y = Term, fill = Term)) +
+  stat_density_ridges(quantile_lines = TRUE, quantiles = 2, alpha = 0.3, jittered_points = TRUE) +
+  geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+  theme_bw() +
+  labs(x = "Estimated Impact on EPA Per Play",
+       y = "Control Variable",
+       title = "Effect of Control Variables on Isolated EPA Per Play",
+       subtitle = "Coefficients from 2010-2021",
+       caption = "Data from NFLfastR, Model @CMHockey66") +
+  theme(axis.title = element_text(size = 12),
+        axis.text = element_text(size = 10),
+        plot.title = element_text(size = 16),
+        plot.subtitle = element_text(size = 14),
+        plot.caption = element_text(size = 12)) +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust=0.5),
+        plot.caption = element_text(hjust=0.5))
+
+control_ridge
+
+
